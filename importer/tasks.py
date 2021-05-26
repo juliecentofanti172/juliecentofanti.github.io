@@ -2,6 +2,7 @@
 See the module-level docstring for implementation details
 """
 
+import concurrent.futures
 import os
 import re
 from functools import wraps
@@ -237,6 +238,35 @@ def get_item_info_from_result(result):
         return
 
     return m.group(1), item_url
+
+
+def fetch_all_urls(items):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=25) as executor:
+        result = executor.map(import_item_count_from_url, items)
+    finals = []
+    totals = 0
+
+    for value, score in result:
+        totals = totals + score
+        finals.append(value)
+
+    return finals, totals
+
+
+def import_item_count_from_url(import_url):
+    """
+    Given a loc.gov URL, return count of files from the resources section
+    """
+    try:
+
+        resp = requests.get(import_url, params={"fo": "json"})
+        resp.raise_for_status()
+        item_data = resp.json()
+        output = len(item_data["resources"][0]["files"])
+        return f"{import_url} - Asset Count: {output}", output
+
+    except Exception as exc:
+        return f"Unhandled exception importing {import_url} {exc}", 0
 
 
 def import_items_into_project_from_url(requesting_user, project, import_url):

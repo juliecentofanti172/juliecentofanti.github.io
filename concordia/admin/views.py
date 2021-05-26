@@ -1,6 +1,10 @@
 import re
+import time
+from urllib.parse import parse_qs, urlparse
 
 from bittersweet.models import validated_get_or_create
+from celery import Celery
+from celery.result import AsyncResult
 from django.contrib import messages
 from django.contrib.admin.views.decorators import staff_member_required
 from django.contrib.auth.decorators import permission_required
@@ -10,7 +14,12 @@ from django.utils.text import slugify
 from django.views.decorators.cache import never_cache
 from tabular_export.core import export_to_csv_response, flatten_queryset
 
-from importer.tasks import import_items_into_project_from_url, redownload_image_task
+from importer.models import ImportItem, ImportItemAsset, ImportJob
+from importer.tasks import (
+    fetch_all_urls,
+    import_items_into_project_from_url,
+    redownload_image_task,
+)
 from importer.utils.excel import slurp_excel
 
 from ..models import Asset, Campaign, Project, SiteReport
@@ -105,6 +114,210 @@ def redownload_images_view(request):
     context["form"] = form
 
     return render(request, "admin/redownload_images.html", context)
+
+
+@never_cache
+@staff_member_required
+@permission_required("concordia.add_campaign")
+@permission_required("concordia.change_campaign")
+@permission_required("concordia.add_project")
+@permission_required("concordia.change_project")
+@permission_required("concordia.add_item")
+@permission_required("concordia.change_item")
+def celery_task_review(request):
+
+    request.current_app = "admin"
+    totalcount = 0
+    counter = 0
+    asset_succesful = 0
+    asset_incomplete = 0
+    asset_failure = 0
+    context = {"title": "Active Importer Tasks"}
+    celery = Celery("concordia")
+    celery.config_from_object("django.conf:settings", namespace="CELERY")
+    context["campaigns"] = all_campaigns = []
+    context["projects"] = all_projects = []
+    id = request.GET.get("id")
+
+    if id is not None:
+        context["campaigns"] = []
+        form = AdminProjectBulkImportForm()
+        projects = Project.objects.filter(campaign_id=int(id))
+        for project in projects:
+            asset_succesful = 0
+            asset_failure = 0
+            asset_incomplete = 0
+            proj_dict = {}
+            proj_dict["title"] = project.title
+            proj_dict["id"] = project.pk
+            proj_dict["campaign_id"] = id
+            messages.info(request, f"{project.title}")
+            importjobs = ImportJob.objects.filter(project_id=project.pk).order_by(
+                "-created"
+            )
+            for importjob in importjobs:
+                job_id = importjob.pk
+                assets = ImportItem.objects.filter(job_id=job_id).order_by("-created")
+                for asset in assets:
+                    res = AsyncResult(str(asset.task_id))
+                    counter = counter + 1
+                    assettasks = ImportItemAsset.objects.filter(import_item_id=asset.pk)
+                    countasset = 0
+                    for assettask in assettasks:
+                        if assettask.failed != None:
+                            asset_failure = asset_failure + 1
+                            messages.warning(
+                                request,
+                                f"{assettask.url}-{assettask.status}",
+                            )
+                        elif (
+                            assettask.completed == None
+                            and assettask.last_started != None
+                        ):
+                            asset_incomplete = asset_incomplete + 1
+                            messages.warning(
+                                request,
+                                f"{assettask.url}-{assettask.status}",
+                            )
+                        else:
+                            asset_succesful = asset_succesful + 1
+                            messages.info(
+                                request,
+                                f"{assettask.url}-{assettask.status}",
+                            )
+                        countasset = countasset + 1
+                        totalcount = totalcount + 1
+            proj_dict["succesful"] = asset_succesful
+            proj_dict["incomplete"] = asset_incomplete
+            proj_dict["failure"] = asset_failure
+            all_projects.append(proj_dict)
+        messages.info(request, f"{totalcount} Total Assets Processed")
+        context["totalassets"] = totalcount
+
+    else:
+        context["projects"] = []
+        for campaigns in Campaign.objects.all():
+            all_campaigns.append(campaigns)
+        form = AdminProjectBulkImportForm()
+
+    context["form"] = form
+    return render(request, "admin/celery_task.html", context)
+
+
+@never_cache
+@staff_member_required
+@permission_required("concordia.add_campaign")
+@permission_required("concordia.change_campaign")
+@permission_required("concordia.add_project")
+@permission_required("concordia.change_project")
+@permission_required("concordia.add_item")
+@permission_required("concordia.change_item")
+def admin_bulk_import_review(request):
+    request.current_app = "admin"
+    url_regex = r"[-\w+]+"
+    pattern = re.compile(url_regex)
+    context = {"title": "Bulk Import Review"}
+
+    urls = []
+    all_urls = []
+    url_counter = 0
+    sum_count = 0
+    if request.method == "POST":
+        form = AdminProjectBulkImportForm(request.POST, request.FILES)
+
+        if form.is_valid():
+            rows = slurp_excel(request.FILES["spreadsheet_file"])
+            required_fields = [
+                "Campaign",
+                "Campaign Short Description",
+                "Campaign Long Description",
+                "Campaign Slug",
+                "Project Slug",
+                "Project",
+                "Project Description",
+                "Import URLs",
+            ]
+            try:
+                for idx, row in enumerate(rows):
+                    missing_fields = [i for i in required_fields if i not in row]
+                    if missing_fields:
+                        messages.warning(
+                            request,
+                            f"Skipping row {idx}: missing fields {missing_fields}",
+                        )
+                        continue
+
+                    campaign_title = row["Campaign"]
+                    project_title = row["Project"]
+                    import_url_blob = row["Import URLs"]
+
+                    if not all((campaign_title, project_title, import_url_blob)):
+                        if not any(row.values()):
+                            # No messages for completely blank rows
+                            continue
+
+                        warning_message = (
+                            f"Skipping row {idx}: at least one required field "
+                            "(Campaign, Project, Import URLs) is empty"
+                        )
+                        messages.warning(request, warning_message)
+                        continue
+
+                    # Read Campaign slug value from excel
+                    campaign_slug = row["Campaign Slug"]
+                    if campaign_slug and not pattern.match(campaign_slug):
+                        messages.warning(
+                            request, "Campaign slug doesn't match pattern."
+                        )
+
+                        # Read Project slug value from excel
+                    project_slug = row["Project Slug"]
+                    if project_slug and not pattern.match(project_slug):
+                        messages.warning(request, "Project slug doesn't match pattern.")
+
+                    potential_urls = filter(None, re.split(r"[\s]+", import_url_blob))
+
+                    for url in potential_urls:
+                        if not url.startswith("http"):
+                            messages.warning(
+                                request, f"Skipping unrecognized URL value: {url}"
+                            )
+                            continue
+
+                        try:
+                            urls.append(url)
+                            url_counter = url_counter + 1
+
+                            if url_counter == 50:
+                                all_urls.append(urls)
+                                url_counter = 0
+                                urls = []
+
+                        except Exception as exc:
+                            messages.error(
+                                request,
+                                f"Unhandled error attempting to count {url}: {exc}",
+                            )
+
+                all_urls.append(urls)
+                for i, val in enumerate(all_urls):
+                    return_result = fetch_all_urls(val)
+                    for res in return_result[0]:
+                        messages.info(request, f"{res}")
+
+                    sum_count = sum_count + return_result[1]
+                    time.sleep(7)
+
+                messages.info(request, f"Total Asset Count:{sum_count}")
+            finally:
+                messages.info(request, "All Processes Completed")
+
+    else:
+        form = AdminProjectBulkImportForm()
+
+    context["form"] = form
+
+    return render(request, "admin/bulk_review.html", context)
 
 
 @never_cache
